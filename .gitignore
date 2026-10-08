@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+blockchain/artifacts/
+blockchain/cache/
+blockchain/typechain-types/
+client/tsconfig.tsbuildinfo
