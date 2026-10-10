@@ -112,3 +112,13 @@ export interface MaterialProcessingRecordInfo {
   processedAt: bigint;
   exists: boolean;
 }
+
+export interface BatchHistoryEventInfo {
+  kind: "TransferCancelled" | "MaterialTransferCancelled" | "BatchCompleted";
+  batchId: number;
+  transferId: number | null;
+  processor?: string;
+  txHash: string;
+  blockNumber: number;
+  timestamp: number;
+}

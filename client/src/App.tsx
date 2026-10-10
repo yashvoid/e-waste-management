@@ -17,9 +17,13 @@ import {
   getMaterialAvailableCustody,
   getAllMaterialProcessingRecords,
   getMaterialProcessingRecordCount,
+  getAllProcessingEvents,
+  getProcessingEventCount,
+  getBatchHistoryEvents,
 } from "./contract";
-import type { ParticipantInfo, BatchInfo, TransferInfo, RecoveredMaterialInfo, MaterialTransferInfo, MaterialProcessingRecordInfo, TxStatus } from "./types";
+import type { ParticipantInfo, BatchInfo, TransferInfo, RecoveredMaterialInfo, MaterialTransferInfo, MaterialProcessingRecordInfo, ProcessingEventInfo, BatchHistoryEventInfo, TxStatus } from "./types";
 import { GRAMS_PER_KG, TRANSFER_STATUS, TRANSFER_STATUS_LABELS } from "./types";
+import { useParticipantCache, type ParticipantNameInfo } from "./useParticipantCache";
 
 const ROLE_GENERATOR = 0;
 const ROLE_COLLECTOR = 1;
@@ -69,9 +73,32 @@ export default function App() {
   const [processingRecordCount, setProcessingRecordCount] = useState(0);
   const [loadingProcessingRecords, setLoadingProcessingRecords] = useState(false);
 
+  const [ewasteProcessingEvents, setEwasteProcessingEvents] = useState<ProcessingEventInfo[]>([]);
+  const [ewasteProcessingEventCount, setEwasteProcessingEventCount] = useState(0);
+  const [loadingEwasteProcessingEvents, setLoadingEwasteProcessingEvents] = useState(false);
+
+  const [historyBatchId, setHistoryBatchId] = useState<number | null>(null);
+
+  const participantCache = useParticipantCache(wallet ? wallet.provider : null);
+
+  useEffect(() => {
+    if (!wallet) return;
+    const addresses = new Set<string>();
+    batches.forEach((b) => addresses.add(b.generator));
+    transfers.forEach((t) => { addresses.add(t.sender); addresses.add(t.receiver); });
+    materials.forEach((m) => addresses.add(m.recycler));
+    materialTransfers.forEach((t) => { addresses.add(t.sender); addresses.add(t.receiver); });
+    processingRecords.forEach((r) => addresses.add(r.processor));
+    ewasteProcessingEvents.forEach((e) => addresses.add(e.recycler));
+    addresses.forEach((addr) => participantCache.ensureParticipant(addr));
+  }, [wallet, batches, transfers, materials, materialTransfers, processingRecords, ewasteProcessingEvents, participantCache]);
+
   const isGenerator = participant?.isRegistered === true && participant.role === ROLE_GENERATOR;
+  const isCollector = participant?.isRegistered === true && participant.role === ROLE_COLLECTOR;
+  const isTransporter = participant?.isRegistered === true && participant.role === ROLE_TRANSPORTER;
   const isRecycler = participant?.isRegistered === true && participant.role === ROLE_RECYCLER;
   const isMaterialProcessor = participant?.isRegistered === true && participant.role === ROLE_MATERIAL_PROCESSOR;
+  const canCreateEwasteTransfers = isGenerator || isCollector || isTransporter;
 
   const fetchParticipant = useCallback(async () => {
     if (!wallet) return;
@@ -176,6 +203,23 @@ export default function App() {
     }
   }, [wallet]);
 
+  const fetchEwasteProcessingEvents = useCallback(async () => {
+    if (!wallet) return;
+    setLoadingEwasteProcessingEvents(true);
+    try {
+      const count = await getProcessingEventCount(wallet.provider);
+      setEwasteProcessingEventCount(count);
+      const all = await getAllProcessingEvents(wallet.provider);
+      all.sort((a, b) => Number(b.id) - Number(a.id));
+      setEwasteProcessingEvents(all);
+    } catch {
+      setEwasteProcessingEvents([]);
+      setEwasteProcessingEventCount(0);
+    } finally {
+      setLoadingEwasteProcessingEvents(false);
+    }
+  }, [wallet]);
+
   useEffect(() => {
     if (wallet && isCorrectNetwork) {
       fetchParticipant();
@@ -184,6 +228,7 @@ export default function App() {
       fetchMaterials();
       fetchMaterialTransfers();
       fetchProcessingRecords();
+      fetchEwasteProcessingEvents();
     } else {
       setParticipant(null);
       setBatches([]);
@@ -196,12 +241,14 @@ export default function App() {
       setMaterialTransferCount(0);
       setProcessingRecords([]);
       setProcessingRecordCount(0);
+      setEwasteProcessingEvents([]);
+      setEwasteProcessingEventCount(0);
     }
-  }, [wallet, isCorrectNetwork, fetchParticipant, fetchBatches, fetchTransfers, fetchMaterials, fetchMaterialTransfers, fetchProcessingRecords]);
+  }, [wallet, isCorrectNetwork, fetchParticipant, fetchBatches, fetchTransfers, fetchMaterials, fetchMaterialTransfers, fetchProcessingRecords, fetchEwasteProcessingEvents]);
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([fetchBatches(), fetchTransfers(), fetchMaterials(), fetchMaterialTransfers(), fetchProcessingRecords()]);
-  }, [fetchBatches, fetchTransfers, fetchMaterials, fetchMaterialTransfers, fetchProcessingRecords]);
+    await Promise.all([fetchBatches(), fetchTransfers(), fetchMaterials(), fetchMaterialTransfers(), fetchProcessingRecords(), fetchEwasteProcessingEvents()]);
+  }, [fetchBatches, fetchTransfers, fetchMaterials, fetchMaterialTransfers, fetchProcessingRecords, fetchEwasteProcessingEvents]);
 
   const handleRegister = async () => {
     if (!wallet) return;
@@ -418,58 +465,17 @@ export default function App() {
                   </div>
                 )}
 
-                {!isGenerator && participant?.isRegistered && (
-                  <div style={styles.infoBox}>
-                    Batch creation is only available to Generators. Your role is{" "}
-                    {ROLE_LABELS[participant.role] ?? "Unknown"}.
-                  </div>
+                {participant?.isRegistered && (
+                  <BatchesSection
+                    batches={batches}
+                    batchCount={batchCount}
+                    loadingBatches={loadingBatches}
+                    participantCache={participantCache}
+                    onViewHistory={(id) => setHistoryBatchId(id)}
+                  />
                 )}
 
-                {participant?.isRegistered && (
-                  <div style={styles.section}>
-                    <h2 style={styles.h2}>E-Waste Batches ({batchCount})</h2>
-                    {loadingBatches && <p style={styles.statusText}>Loading batches...</p>}
-                    {!loadingBatches && batches.length === 0 && (
-                      <p style={styles.statusText}>No batches have been created yet.</p>
-                    )}
-                    {batches.length > 0 && (
-                      <div style={styles.batchList}>
-                        {batches.map((batch) => (
-                          <div key={Number(batch.id)} style={styles.batchCard}>
-                            <div style={styles.batchHeader}>
-                              <span style={styles.batchId}>Batch #{Number(batch.id)}</span>
-                              <span style={batch.status === BATCH_STATUS_ACTIVE ? styles.statusActive : styles.statusDone}>
-                                {batch.status === BATCH_STATUS_ACTIVE ? "Active" : "Completed"}
-                              </span>
-                            </div>
-                            <div style={styles.batchRow}>
-                              <span style={styles.label}>Generator</span>
-                              <span style={styles.mono}>{shortAddr(batch.generator)}</span>
-                            </div>
-                            <div style={styles.batchRow}>
-                              <span style={styles.label}>Original quantity</span>
-                              <span>{formatGrams(batch.originalQuantityGrams)}</span>
-                            </div>
-                            <div style={styles.batchRow}>
-                              <span style={styles.label}>Available</span>
-                              <span>{formatGrams(batch.availableQuantityGrams)}</span>
-                            </div>
-                            <div style={styles.batchRow}>
-                              <span style={styles.label}>Pending</span>
-                              <span>{formatGrams(batch.pendingQuantityGrams)}</span>
-                            </div>
-                            <div style={styles.batchRow}>
-                              <span style={styles.label}>Created</span>
-                              <span>{new Date(Number(batch.createdAt) * 1000).toLocaleString()}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {participant?.isRegistered && (
+                {(isCollector || isTransporter || isRecycler) && (
                   <BatchCustodySection
                     wallet={wallet}
                     participant={participant}
@@ -478,7 +484,7 @@ export default function App() {
                   />
                 )}
 
-                {participant?.isRegistered && participant.role !== ROLE_MATERIAL_PROCESSOR && (
+                {canCreateEwasteTransfers && (
                   <CreateTransferSection
                     wallet={wallet}
                     participant={participant}
@@ -489,7 +495,7 @@ export default function App() {
                   />
                 )}
 
-                {participant?.isRegistered && (
+                {(isGenerator || isCollector || isTransporter || isRecycler) && (
                   <TransfersSection
                     wallet={wallet}
                     participant={participant}
@@ -497,8 +503,12 @@ export default function App() {
                     loadingTransfers={loadingTransfers}
                     transferCount={transferCount}
                     onRefresh={refreshAll}
+                    participantCache={participantCache}
                   />
                 )}
+
+
+
 
                 {isRecycler && (
                   <ProcessEwasteSection
@@ -508,13 +518,14 @@ export default function App() {
                   />
                 )}
 
-                {participant?.isRegistered && (
+                {(isRecycler || isMaterialProcessor) && (
                   <MaterialsSection
                     wallet={wallet}
                     materials={materials}
                     materialCount={materialCount}
                     loadingMaterials={loadingMaterials}
                     participant={participant}
+                    participantCache={participantCache}
                   />
                 )}
 
@@ -526,7 +537,7 @@ export default function App() {
                   />
                 )}
 
-                {participant?.isRegistered && (
+                {(isRecycler || isMaterialProcessor) && (
                   <MaterialTransfersSection
                     wallet={wallet}
                     participant={participant}
@@ -534,6 +545,7 @@ export default function App() {
                     loadingMaterialTransfers={loadingMaterialTransfers}
                     materialTransferCount={materialTransferCount}
                     onRefresh={refreshAll}
+                    participantCache={participantCache}
                   />
                 )}
 
@@ -546,11 +558,27 @@ export default function App() {
                   />
                 )}
 
-                {participant?.isRegistered && (
+                {isMaterialProcessor && (
                   <ProcessingHistorySection
                     processingRecords={processingRecords}
                     processingRecordCount={processingRecordCount}
                     loadingProcessingRecords={loadingProcessingRecords}
+                    participantCache={participantCache}
+                  />
+                )}
+
+                {historyBatchId !== null && wallet && (
+                  <BatchHistoryView
+                    batchId={historyBatchId}
+                    batches={batches}
+                    transfers={transfers}
+                    materials={materials}
+                    materialTransfers={materialTransfers}
+                    processingRecords={processingRecords}
+                    ewasteProcessingEvents={ewasteProcessingEvents}
+                    participantCache={participantCache}
+                    provider={wallet.provider}
+                    onBack={() => setHistoryBatchId(null)}
                   />
                 )}
               </>
@@ -558,6 +586,83 @@ export default function App() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Batches table
+// ---------------------------------------------------------------------------
+
+function BatchesSection({
+  batches,
+  batchCount,
+  loadingBatches,
+  participantCache,
+  onViewHistory,
+}: {
+  batches: BatchInfo[];
+  batchCount: number;
+  loadingBatches: boolean;
+  participantCache: ReturnType<typeof useParticipantCache>;
+  onViewHistory: (id: number) => void;
+}) {
+  if (loadingBatches) {
+    return (
+      <div style={styles.section}>
+        <h2 style={styles.h2}>E-Waste Batches</h2>
+        <p style={styles.statusText}>Loading batches...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.section}>
+      <h2 style={styles.h2}>E-Waste Batches ({batchCount})</h2>
+      {batches.length === 0 ? (
+        <p style={styles.statusText}>No batches have been created yet.</p>
+      ) : (
+        <div style={styles.tableWrap}>
+          <div style={styles.tableHead}>
+            <span style={styles.colId}>ID</span>
+            <span style={styles.colFlex}>Generator</span>
+            <span style={styles.colQty}>Original</span>
+            <span style={styles.colQty}>Available</span>
+            <span style={styles.colQty}>Pending</span>
+            <span style={styles.colStatus}>Status</span>
+            <span style={styles.colDate}>Created</span>
+            <span style={styles.colAction}>Actions</span>
+          </div>
+          {batches.map((batch) => (
+            <div key={Number(batch.id)} style={styles.tableRow}>
+              <span style={styles.colId}>#{Number(batch.id)}</span>
+              <span style={styles.colFlex}>
+                <ParticipantNameDisplay
+                  address={batch.generator}
+                  info={participantCache.getParticipant(batch.generator)}
+                />
+              </span>
+              <span style={styles.colQty}>{formatGrams(batch.originalQuantityGrams)}</span>
+              <span style={styles.colQty}>{formatGrams(batch.availableQuantityGrams)}</span>
+              <span style={styles.colQty}>{formatGrams(batch.pendingQuantityGrams)}</span>
+              <span style={styles.colStatus}>
+                <span style={batch.status === BATCH_STATUS_ACTIVE ? styles.statusActive : styles.statusDone}>
+                  {batch.status === BATCH_STATUS_ACTIVE ? "Active" : "Completed"}
+                </span>
+              </span>
+              <span style={styles.colDate}>{formatDate(batch.createdAt)}</span>
+              <span style={styles.colAction}>
+                <button
+                  style={{ ...styles.buttonSmall, ...styles.buttonSecondary }}
+                  onClick={() => onViewHistory(Number(batch.id))}
+                >
+                  View History
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -735,14 +840,7 @@ function CreateTransferSection({
   };
 
   if (!canCreateTransfers) {
-    return (
-      <div style={styles.section}>
-        <h2 style={styles.h2}>Create Transfer</h2>
-        <p style={styles.statusText}>
-          Your role ({ROLE_LABELS[participant.role]}) cannot create e-waste transfers.
-        </p>
-      </div>
-    );
+    return null;
   }
 
   return (
@@ -841,6 +939,7 @@ function TransfersSection({
   loadingTransfers,
   transferCount,
   onRefresh,
+  participantCache,
 }: {
   wallet: { address: string; provider: BrowserProvider };
   participant: ParticipantInfo;
@@ -848,13 +947,25 @@ function TransfersSection({
   loadingTransfers: boolean;
   transferCount: number;
   onRefresh: () => Promise<void>;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   const [actionTxStatus, setActionTxStatus] = useState<TxStatus>({ state: "idle", message: "" });
+  const [dirFilter, setDirFilter] = useState<"all" | "incoming" | "outgoing">("all");
+  const [statusFilter, setStatusFilter] = useState<number | "all">("all");
+
+  const walletAddr = wallet.address.toLowerCase();
+
+  const filtered = transfers.filter((t) => {
+    if (dirFilter === "incoming" && t.receiver.toLowerCase() !== walletAddr) return false;
+    if (dirFilter === "outgoing" && t.sender.toLowerCase() !== walletAddr) return false;
+    if (statusFilter !== "all" && t.status !== statusFilter) return false;
+    return true;
+  });
 
   if (loadingTransfers) {
     return (
       <div style={styles.section}>
-        <h2 style={styles.h2}>Transfers</h2>
+        <h2 style={styles.h2}>E-Waste Transfers</h2>
         <p style={styles.statusText}>Loading transfers...</p>
       </div>
     );
@@ -862,22 +973,67 @@ function TransfersSection({
 
   return (
     <div style={styles.section}>
-      <h2 style={styles.h2}>Transfers ({transferCount})</h2>
+      <h2 style={styles.h2}>E-Waste Transfers ({transferCount})</h2>
+
+      {transfers.length > 0 && (
+        <div style={styles.filterBar}>
+          <div style={styles.filterGroup}>
+            {(["all", "incoming", "outgoing"] as const).map((d) => (
+              <button
+                key={d}
+                style={dirFilter === d ? styles.filterBtnActive : styles.filterBtn}
+                onClick={() => setDirFilter(d)}
+              >
+                {d === "all" ? "All" : d === "incoming" ? "Incoming" : "Outgoing"}
+              </button>
+            ))}
+          </div>
+          <div style={styles.filterGroup}>
+            <button
+              style={statusFilter === "all" ? styles.filterBtnActive : styles.filterBtn}
+              onClick={() => setStatusFilter("all")}
+            >
+              All Statuses
+            </button>
+            {Object.values(TRANSFER_STATUS).map((s) => (
+              <button
+                key={s}
+                style={statusFilter === s ? styles.filterBtnActive : styles.filterBtn}
+                onClick={() => setStatusFilter(s)}
+              >
+                {TRANSFER_STATUS_LABELS[s]}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <TxStatusBox txStatus={actionTxStatus} />
 
       {transfers.length === 0 ? (
         <p style={styles.statusText}>No transfers found.</p>
+      ) : filtered.length === 0 ? (
+        <p style={styles.statusText}>No transfers match the selected filters.</p>
       ) : (
-        <div style={styles.transferList}>
-          {transfers.map((transfer) => (
-            <TransferCard
+        <div style={styles.tableWrap}>
+          <div style={styles.tableHead}>
+            <span style={styles.colId}>ID</span>
+            <span style={styles.colFlex}>From / To</span>
+            <span style={styles.colQty}>Declared</span>
+            <span style={styles.colQty}>Received</span>
+            <span style={styles.colQty}>Diff</span>
+            <span style={styles.colStatus}>Status</span>
+            <span style={styles.colDate}>Created</span>
+          </div>
+          {filtered.map((transfer) => (
+            <TransferRow
               key={Number(transfer.id)}
               transfer={transfer}
               wallet={wallet}
-              participant={participant}
               actionTxStatus={actionTxStatus}
               setActionTxStatus={setActionTxStatus}
               onRefresh={onRefresh}
+              participantCache={participantCache}
             />
           ))}
         </div>
@@ -886,22 +1042,23 @@ function TransfersSection({
   );
 }
 
-function TransferCard({
+function TransferRow({
   transfer,
   wallet,
-  participant,
   actionTxStatus,
   setActionTxStatus,
   onRefresh,
+  participantCache,
 }: {
   transfer: TransferInfo;
   wallet: { address: string; provider: BrowserProvider };
-  participant: ParticipantInfo;
   actionTxStatus: TxStatus;
   setActionTxStatus: (s: TxStatus) => void;
   onRefresh: () => Promise<void>;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   const [receiveQtyKg, setReceiveQtyKg] = useState<string>("");
+  const [expanded, setExpanded] = useState(false);
 
   const isSender = transfer.sender.toLowerCase() === wallet.address.toLowerCase();
   const isReceiver = transfer.receiver.toLowerCase() === wallet.address.toLowerCase();
@@ -912,6 +1069,8 @@ function TransferCard({
   const canApproveSender = isSender && status === TRANSFER_STATUS.Received && !transfer.senderApproved;
   const canApproveReceiver = isReceiver && status === TRANSFER_STATUS.Received && !transfer.receiverApproved;
   const canCancel = isSender && status === TRANSFER_STATUS.Pending;
+  const hasActions = canReceive || canApproveSender || canApproveReceiver || canCancel;
+  const isParty = isSender || isReceiver;
 
   const handleReceive = async () => {
     const grams = kgToGrams(receiveQtyKg);
@@ -923,7 +1082,6 @@ function TransferCard({
       setActionTxStatus({ state: "failed", message: "Received quantity cannot exceed declared quantity." });
       return;
     }
-
     setActionTxStatus({ state: "preparing", message: "Preparing transaction..." });
     try {
       const signer = await wallet.provider.getSigner();
@@ -963,138 +1121,134 @@ function TransferCard({
     }
   };
 
+  const receivedGrams = transfer.receivedQuantityGrams;
+  const declaredGrams = transfer.declaredQuantityGrams;
+  const diff = receivedGrams > 0n ? declaredGrams - receivedGrams : null;
+
   return (
-    <div style={styles.transferCard}>
-      <div style={styles.transferHeader}>
-        <span style={styles.transferId}>Transfer #{Number(transfer.id)}</span>
-        <span style={statusBadgeStyle(status)}>{statusLabel}</span>
-      </div>
-
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Batch</span>
-        <span>#{Number(transfer.batchId)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Sender</span>
-        <span style={styles.mono}>{shortAddr(transfer.sender)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Receiver</span>
-        <span style={styles.mono}>{shortAddr(transfer.receiver)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Declared quantity</span>
-        <span>{formatGrams(transfer.declaredQuantityGrams)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Received quantity</span>
-        <span>
-          {transfer.receivedQuantityGrams > 0n
-            ? formatGrams(transfer.receivedQuantityGrams)
-            : "—"}
-        </span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Created</span>
-        <span>{new Date(Number(transfer.createdAt) * 1000).toLocaleString()}</span>
-      </div>
-
-      {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
-        <div style={styles.approvalRow}>
-          <span style={styles.label}>Sender approval</span>
-          <span style={transfer.senderApproved ? styles.approved : styles.pendingApproval}>
-            {transfer.senderApproved ? "Approved" : "Pending"}
-          </span>
-        </div>
-      )}
-      {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
-        <div style={styles.approvalRow}>
-          <span style={styles.label}>Receiver approval</span>
-          <span style={transfer.receiverApproved ? styles.approved : styles.pendingApproval}>
-            {transfer.receiverApproved ? "Approved" : "Pending"}
-          </span>
-        </div>
-      )}
-
-      {canReceive && (
-        <div style={styles.actionGroup}>
-          <label style={styles.formLabel}>Record received quantity (kg)</label>
-          <div style={styles.inlineForm}>
-            <input
-              type="text"
-              inputMode="decimal"
-              style={styles.input}
-              value={receiveQtyKg}
-              onChange={(e) => setReceiveQtyKg(e.target.value)}
-              placeholder="e.g. 95"
-            />
-            <button
-              style={{
-                ...styles.button,
-                ...styles.buttonBlue,
-                ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-              }}
-              onClick={handleReceive}
-              disabled={isTxInProgress(actionTxStatus)}
-            >
-              Record
-            </button>
+    <>
+      <div
+        style={{ ...styles.tableRow, ...(isParty && hasActions ? styles.tableRowClickable : {}) }}
+        onClick={() => isParty && hasActions && setExpanded(!expanded)}
+      >
+        <span style={styles.colId}>#{Number(transfer.id)}</span>
+        <span style={styles.colFlex}>
+          <div style={styles.fromToCell}>
+            <span style={styles.fromToLine}>
+              <span style={styles.fromToArrow}>From</span>
+              <ParticipantNameDisplay
+                address={transfer.sender}
+                info={participantCache.getParticipant(transfer.sender)}
+              />
+            </span>
+            <span style={styles.fromToLine}>
+              <span style={styles.fromToArrow}>To</span>
+              <ParticipantNameDisplay
+                address={transfer.receiver}
+                info={participantCache.getParticipant(transfer.receiver)}
+              />
+            </span>
           </div>
+        </span>
+        <span style={styles.colQty}>{formatGrams(declaredGrams)}</span>
+        <span style={styles.colQty}>{receivedGrams > 0n ? formatGrams(receivedGrams) : "\u2014"}</span>
+        <span style={styles.colQty}>{diff !== null && diff !== 0n ? formatGrams(diff) : "\u2014"}</span>
+        <span style={styles.colStatus}>
+          <span style={statusBadgeStyle(status)}>{statusLabel}</span>
+        </span>
+        <span style={styles.colDate}>{formatDate(transfer.createdAt)}</span>
+      </div>
+
+      {expanded && isParty && (
+        <div style={styles.rowDetail}>
+          <div style={styles.rowDetailMeta}>
+            <span>Batch #{Number(transfer.batchId)}</span>
+            {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
+              <span style={styles.rowDetailApprovals}>
+                Sender: {transfer.senderApproved ? "Approved" : "Pending"}
+                {" \u00b7 "}
+                Receiver: {transfer.receiverApproved ? "Approved" : "Pending"}
+              </span>
+            )}
+          </div>
+
+          {canReceive && (
+            <div style={styles.actionGroup}>
+              <label style={styles.formLabel}>Record received quantity (kg)</label>
+              <div style={styles.inlineForm}>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  style={styles.input}
+                  value={receiveQtyKg}
+                  onChange={(e) => setReceiveQtyKg(e.target.value)}
+                  placeholder="e.g. 95"
+                />
+                <button
+                  style={{
+                    ...styles.button,
+                    ...styles.buttonBlue,
+                    ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                  }}
+                  onClick={handleReceive}
+                  disabled={isTxInProgress(actionTxStatus)}
+                >
+                  Record
+                </button>
+              </div>
+            </div>
+          )}
+
+          {canApproveSender && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonBlue,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleApprove}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Approve as Sender
+              </button>
+            </div>
+          )}
+
+          {canApproveReceiver && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonBlue,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleApprove}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Approve as Receiver
+              </button>
+            </div>
+          )}
+
+          {canCancel && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonRed,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleCancel}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Cancel Transfer
+              </button>
+            </div>
+          )}
         </div>
       )}
-
-      {canApproveSender && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonBlue,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleApprove}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Approve as Sender
-          </button>
-        </div>
-      )}
-
-      {canApproveReceiver && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonBlue,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleApprove}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Approve as Receiver
-          </button>
-        </div>
-      )}
-
-      {canCancel && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonRed,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleCancel}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Cancel Transfer
-          </button>
-        </div>
-      )}
-
-      {!isSender && !isReceiver && (
-        <p style={styles.hint}>You are not a party to this transfer.</p>
-      )}
-    </div>
+    </>
   );
 }
 
@@ -1138,9 +1292,32 @@ function formatGrams(grams: bigint): string {
   return `${g.toLocaleString()} g`;
 }
 
+function formatDate(timestamp: bigint): string {
+  const ts = Number(timestamp);
+  if (ts === 0) return "\u2014";
+  return new Date(ts * 1000).toLocaleString();
+}
+
 function shortAddr(addr: string): string {
   if (addr.length < 12) return addr;
   return `${addr.slice(0, 8)}...${addr.slice(-6)}`;
+}
+
+function ParticipantNameDisplay({
+  address,
+  info,
+}: {
+  address: string;
+  info: ParticipantNameInfo;
+}) {
+  return (
+    <span style={styles.participantNameCell}>
+      <span style={styles.participantName}>
+        {info.loading ? "Loading…" : info.name}
+      </span>
+      <span style={styles.mono}>{shortAddr(address)}</span>
+    </span>
+  );
 }
 
 function statusBadgeStyle(status: number): React.CSSProperties {
@@ -1640,12 +1817,14 @@ function MaterialsSection({
   materialCount,
   loadingMaterials,
   participant,
+  participantCache,
 }: {
   wallet: { address: string; provider: BrowserProvider };
   materials: RecoveredMaterialInfo[];
   materialCount: number;
   loadingMaterials: boolean;
   participant: ParticipantInfo;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   if (loadingMaterials) {
     return (
@@ -1688,7 +1867,10 @@ function MaterialsSection({
               </div>
               <div style={styles.batchRow}>
                 <span style={styles.label}>Recycler</span>
-                <span style={styles.mono}>{shortAddr(material.recycler)}</span>
+                <ParticipantNameDisplay
+                  address={material.recycler}
+                  info={participantCache.getParticipant(material.recycler)}
+                />
               </div>
               <div style={styles.batchRow}>
                 <span style={styles.label}>Produced</span>
@@ -1897,6 +2079,7 @@ function MaterialTransfersSection({
   loadingMaterialTransfers,
   materialTransferCount,
   onRefresh,
+  participantCache,
 }: {
   wallet: { address: string; provider: BrowserProvider };
   participant: ParticipantInfo;
@@ -1904,8 +2087,20 @@ function MaterialTransfersSection({
   loadingMaterialTransfers: boolean;
   materialTransferCount: number;
   onRefresh: () => Promise<void>;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   const [actionTxStatus, setActionTxStatus] = useState<TxStatus>({ state: "idle", message: "" });
+  const [dirFilter, setDirFilter] = useState<"all" | "incoming" | "outgoing">("all");
+  const [statusFilter, setStatusFilter] = useState<number | "all">("all");
+
+  const walletAddr = wallet.address.toLowerCase();
+
+  const filtered = materialTransfers.filter((t) => {
+    if (dirFilter === "incoming" && t.receiver.toLowerCase() !== walletAddr) return false;
+    if (dirFilter === "outgoing" && t.sender.toLowerCase() !== walletAddr) return false;
+    if (statusFilter !== "all" && t.status !== statusFilter) return false;
+    return true;
+  });
 
   if (loadingMaterialTransfers) {
     return (
@@ -1919,21 +2114,66 @@ function MaterialTransfersSection({
   return (
     <div style={styles.section}>
       <h2 style={styles.h2}>Material Transfers ({materialTransferCount})</h2>
+
+      {materialTransfers.length > 0 && (
+        <div style={styles.filterBar}>
+          <div style={styles.filterGroup}>
+            {(["all", "incoming", "outgoing"] as const).map((d) => (
+              <button
+                key={d}
+                style={dirFilter === d ? styles.filterBtnActive : styles.filterBtn}
+                onClick={() => setDirFilter(d)}
+              >
+                {d === "all" ? "All" : d === "incoming" ? "Incoming" : "Outgoing"}
+              </button>
+            ))}
+          </div>
+          <div style={styles.filterGroup}>
+            <button
+              style={statusFilter === "all" ? styles.filterBtnActive : styles.filterBtn}
+              onClick={() => setStatusFilter("all")}
+            >
+              All Statuses
+            </button>
+            {Object.values(TRANSFER_STATUS).map((s) => (
+              <button
+                key={s}
+                style={statusFilter === s ? styles.filterBtnActive : styles.filterBtn}
+                onClick={() => setStatusFilter(s)}
+              >
+                {TRANSFER_STATUS_LABELS[s]}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <TxStatusBox txStatus={actionTxStatus} />
 
       {materialTransfers.length === 0 ? (
         <p style={styles.statusText}>No material transfers found.</p>
+      ) : filtered.length === 0 ? (
+        <p style={styles.statusText}>No material transfers match the selected filters.</p>
       ) : (
-        <div style={styles.transferList}>
-          {materialTransfers.map((transfer) => (
-            <MaterialTransferCard
+        <div style={styles.tableWrap}>
+          <div style={styles.tableHead}>
+            <span style={styles.colId}>ID</span>
+            <span style={styles.colFlex}>From / To</span>
+            <span style={styles.colQty}>Declared</span>
+            <span style={styles.colQty}>Received</span>
+            <span style={styles.colQty}>Diff</span>
+            <span style={styles.colStatus}>Status</span>
+            <span style={styles.colDate}>Created</span>
+          </div>
+          {filtered.map((transfer) => (
+            <MaterialTransferRow
               key={Number(transfer.id)}
               transfer={transfer}
               wallet={wallet}
-              participant={participant}
               actionTxStatus={actionTxStatus}
               setActionTxStatus={setActionTxStatus}
               onRefresh={onRefresh}
+              participantCache={participantCache}
             />
           ))}
         </div>
@@ -1942,21 +2182,23 @@ function MaterialTransfersSection({
   );
 }
 
-function MaterialTransferCard({
+function MaterialTransferRow({
   transfer,
   wallet,
   actionTxStatus,
   setActionTxStatus,
   onRefresh,
+  participantCache,
 }: {
   transfer: MaterialTransferInfo;
   wallet: { address: string; provider: BrowserProvider };
-  participant: ParticipantInfo;
   actionTxStatus: TxStatus;
   setActionTxStatus: (s: TxStatus) => void;
   onRefresh: () => Promise<void>;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   const [receiveQtyKg, setReceiveQtyKg] = useState<string>("");
+  const [expanded, setExpanded] = useState(false);
 
   const isSender = transfer.sender.toLowerCase() === wallet.address.toLowerCase();
   const isReceiver = transfer.receiver.toLowerCase() === wallet.address.toLowerCase();
@@ -1967,6 +2209,8 @@ function MaterialTransferCard({
   const canApproveSender = isSender && status === TRANSFER_STATUS.Received && !transfer.senderApproved;
   const canApproveReceiver = isReceiver && status === TRANSFER_STATUS.Received && !transfer.receiverApproved;
   const canCancel = isSender && status === TRANSFER_STATUS.Pending;
+  const hasActions = canReceive || canApproveSender || canApproveReceiver || canCancel;
+  const isParty = isSender || isReceiver;
 
   const handleReceive = async () => {
     const grams = kgToGrams(receiveQtyKg);
@@ -1978,7 +2222,6 @@ function MaterialTransferCard({
       setActionTxStatus({ state: "failed", message: "Received quantity cannot exceed declared quantity." });
       return;
     }
-
     setActionTxStatus({ state: "preparing", message: "Preparing transaction..." });
     try {
       const signer = await wallet.provider.getSigner();
@@ -2018,142 +2261,134 @@ function MaterialTransferCard({
     }
   };
 
+  const receivedGrams = transfer.receivedQuantityGrams;
+  const declaredGrams = transfer.declaredQuantityGrams;
+  const diff = receivedGrams > 0n ? declaredGrams - receivedGrams : null;
+
   return (
-    <div style={styles.transferCard}>
-      <div style={styles.transferHeader}>
-        <span style={styles.transferId}>Material Transfer #{Number(transfer.id)}</span>
-        <span style={statusBadgeStyle(status)}>{statusLabel}</span>
-      </div>
-
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Material</span>
-        <span>#{Number(transfer.materialId)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Batch</span>
-        <span>#{Number(transfer.batchId)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Sender</span>
-        <span style={styles.mono}>{shortAddr(transfer.sender)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Receiver</span>
-        <span style={styles.mono}>{shortAddr(transfer.receiver)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Declared quantity</span>
-        <span>{formatGrams(transfer.declaredQuantityGrams)}</span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Received quantity</span>
-        <span>
-          {transfer.receivedQuantityGrams > 0n
-            ? formatGrams(transfer.receivedQuantityGrams)
-            : "—"}
-        </span>
-      </div>
-      <div style={styles.batchRow}>
-        <span style={styles.label}>Created</span>
-        <span>{new Date(Number(transfer.createdAt) * 1000).toLocaleString()}</span>
-      </div>
-
-      {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
-        <div style={styles.approvalRow}>
-          <span style={styles.label}>Sender approval</span>
-          <span style={transfer.senderApproved ? styles.approved : styles.pendingApproval}>
-            {transfer.senderApproved ? "Approved" : "Pending"}
-          </span>
-        </div>
-      )}
-      {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
-        <div style={styles.approvalRow}>
-          <span style={styles.label}>Receiver approval</span>
-          <span style={transfer.receiverApproved ? styles.approved : styles.pendingApproval}>
-            {transfer.receiverApproved ? "Approved" : "Pending"}
-          </span>
-        </div>
-      )}
-
-      {canReceive && (
-        <div style={styles.actionGroup}>
-          <label style={styles.formLabel}>Record received quantity (kg)</label>
-          <div style={styles.inlineForm}>
-            <input
-              type="text"
-              inputMode="decimal"
-              style={styles.input}
-              value={receiveQtyKg}
-              onChange={(e) => setReceiveQtyKg(e.target.value)}
-              placeholder="e.g. 68"
-            />
-            <button
-              style={{
-                ...styles.button,
-                ...styles.buttonBlue,
-                ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-              }}
-              onClick={handleReceive}
-              disabled={isTxInProgress(actionTxStatus)}
-            >
-              Record
-            </button>
+    <>
+      <div
+        style={{ ...styles.tableRow, ...(isParty && hasActions ? styles.tableRowClickable : {}) }}
+        onClick={() => isParty && hasActions && setExpanded(!expanded)}
+      >
+        <span style={styles.colId}>#{Number(transfer.id)}</span>
+        <span style={styles.colFlex}>
+          <div style={styles.fromToCell}>
+            <span style={styles.fromToLine}>
+              <span style={styles.fromToArrow}>From</span>
+              <ParticipantNameDisplay
+                address={transfer.sender}
+                info={participantCache.getParticipant(transfer.sender)}
+              />
+            </span>
+            <span style={styles.fromToLine}>
+              <span style={styles.fromToArrow}>To</span>
+              <ParticipantNameDisplay
+                address={transfer.receiver}
+                info={participantCache.getParticipant(transfer.receiver)}
+              />
+            </span>
           </div>
+        </span>
+        <span style={styles.colQty}>{formatGrams(declaredGrams)}</span>
+        <span style={styles.colQty}>{receivedGrams > 0n ? formatGrams(receivedGrams) : "\u2014"}</span>
+        <span style={styles.colQty}>{diff !== null && diff !== 0n ? formatGrams(diff) : "\u2014"}</span>
+        <span style={styles.colStatus}>
+          <span style={statusBadgeStyle(status)}>{statusLabel}</span>
+        </span>
+        <span style={styles.colDate}>{formatDate(transfer.createdAt)}</span>
+      </div>
+
+      {expanded && isParty && (
+        <div style={styles.rowDetail}>
+          <div style={styles.rowDetailMeta}>
+            <span>Material #{Number(transfer.materialId)} {" \u00b7 "} Batch #{Number(transfer.batchId)}</span>
+            {status >= TRANSFER_STATUS.Received && status !== TRANSFER_STATUS.Cancelled && (
+              <span style={styles.rowDetailApprovals}>
+                Sender: {transfer.senderApproved ? "Approved" : "Pending"}
+                {" \u00b7 "}
+                Receiver: {transfer.receiverApproved ? "Approved" : "Pending"}
+              </span>
+            )}
+          </div>
+
+          {canReceive && (
+            <div style={styles.actionGroup}>
+              <label style={styles.formLabel}>Record received quantity (kg)</label>
+              <div style={styles.inlineForm}>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  style={styles.input}
+                  value={receiveQtyKg}
+                  onChange={(e) => setReceiveQtyKg(e.target.value)}
+                  placeholder="e.g. 68"
+                />
+                <button
+                  style={{
+                    ...styles.button,
+                    ...styles.buttonBlue,
+                    ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                  }}
+                  onClick={handleReceive}
+                  disabled={isTxInProgress(actionTxStatus)}
+                >
+                  Record
+                </button>
+              </div>
+            </div>
+          )}
+
+          {canApproveSender && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonBlue,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleApprove}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Approve as Sender
+              </button>
+            </div>
+          )}
+
+          {canApproveReceiver && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonBlue,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleApprove}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Approve as Receiver
+              </button>
+            </div>
+          )}
+
+          {canCancel && (
+            <div style={styles.actionGroup}>
+              <button
+                style={{
+                  ...styles.button,
+                  ...styles.buttonRed,
+                  ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
+                }}
+                onClick={handleCancel}
+                disabled={isTxInProgress(actionTxStatus)}
+              >
+                Cancel Transfer
+              </button>
+            </div>
+          )}
         </div>
       )}
-
-      {canApproveSender && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonBlue,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleApprove}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Approve as Sender
-          </button>
-        </div>
-      )}
-
-      {canApproveReceiver && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonBlue,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleApprove}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Approve as Receiver
-          </button>
-        </div>
-      )}
-
-      {canCancel && (
-        <div style={styles.actionGroup}>
-          <button
-            style={{
-              ...styles.button,
-              ...styles.buttonRed,
-              ...(isTxInProgress(actionTxStatus) ? styles.buttonDisabled : {}),
-            }}
-            onClick={handleCancel}
-            disabled={isTxInProgress(actionTxStatus)}
-          >
-            Cancel Transfer
-          </button>
-        </div>
-      )}
-
-      {!isSender && !isReceiver && (
-        <p style={styles.hint}>You are not a party to this transfer.</p>
-      )}
-    </div>
+    </>
   );
 }
 
@@ -2320,10 +2555,12 @@ function ProcessingHistorySection({
   processingRecords,
   processingRecordCount,
   loadingProcessingRecords,
+  participantCache,
 }: {
   processingRecords: MaterialProcessingRecordInfo[];
   processingRecordCount: number;
   loadingProcessingRecords: boolean;
+  participantCache: ReturnType<typeof useParticipantCache>;
 }) {
   if (loadingProcessingRecords) {
     return (
@@ -2356,7 +2593,10 @@ function ProcessingHistorySection({
               </div>
               <div style={styles.batchRow}>
                 <span style={styles.label}>Processor</span>
-                <span style={styles.mono}>{shortAddr(record.processor)}</span>
+                <ParticipantNameDisplay
+                  address={record.processor}
+                  info={participantCache.getParticipant(record.processor)}
+                />
               </div>
               <div style={styles.batchRow}>
                 <span style={styles.label}>Processed quantity</span>
@@ -2365,6 +2605,487 @@ function ProcessingHistorySection({
               <div style={styles.batchRow}>
                 <span style={styles.label}>Date</span>
                 <span>{new Date(Number(record.processedAt) * 1000).toLocaleString()}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Batch History View
+// ---------------------------------------------------------------------------
+
+interface HistoryEntry {
+  timestamp: number;
+  sortKey: string;
+  title: string;
+  details: React.ReactNode;
+  txHash?: string;
+}
+
+function BatchHistoryView({
+  batchId,
+  batches,
+  transfers,
+  materials,
+  materialTransfers,
+  processingRecords,
+  ewasteProcessingEvents,
+  participantCache,
+  provider,
+  onBack,
+}: {
+  batchId: number;
+  batches: BatchInfo[];
+  transfers: TransferInfo[];
+  materials: RecoveredMaterialInfo[];
+  materialTransfers: MaterialTransferInfo[];
+  processingRecords: MaterialProcessingRecordInfo[];
+  ewasteProcessingEvents: ProcessingEventInfo[];
+  participantCache: ReturnType<typeof useParticipantCache>;
+  provider: BrowserProvider;
+  onBack: () => void;
+}) {
+  const batch = batches.find((b) => Number(b.id) === batchId);
+
+  const batchTransfers = transfers.filter((t) => Number(t.batchId) === batchId);
+  const batchMaterials = materials.filter((m) => Number(m.batchId) === batchId);
+  const batchMaterialTransfers = materialTransfers.filter((t) => Number(t.batchId) === batchId);
+  const batchProcessingRecords = processingRecords.filter((r) => Number(r.batchId) === batchId);
+  const batchEwasteEvents = ewasteProcessingEvents.filter((e) => Number(e.batchId) === batchId);
+
+  const [historyEvents, setHistoryEvents] = useState<BatchHistoryEventInfo[]>([]);
+
+  const ewasteTransferKey = batchTransfers.map((t) => Number(t.id)).join(",");
+  const materialTransferKey = batchMaterialTransfers.map((t) => Number(t.id)).join(",");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchEvents() {
+      const ewasteTransferIds = ewasteTransferKey
+        ? ewasteTransferKey.split(",").map(Number)
+        : [];
+      const materialTransferIds = materialTransferKey
+        ? materialTransferKey.split(",").map(Number)
+        : [];
+      try {
+        const events = await getBatchHistoryEvents(
+          provider,
+          batchId,
+          ewasteTransferIds,
+          materialTransferIds,
+        );
+        if (!cancelled) setHistoryEvents(events);
+      } catch {
+        if (!cancelled) setHistoryEvents([]);
+      }
+    }
+    fetchEvents();
+    return () => { cancelled = true; };
+  }, [provider, batchId, ewasteTransferKey, materialTransferKey]);
+
+  const cancelEventMap = new Map<number, BatchHistoryEventInfo>();
+  const matCancelEventMap = new Map<number, BatchHistoryEventInfo>();
+  let batchCompletedEvent: BatchHistoryEventInfo | null = null;
+  for (const ev of historyEvents) {
+    if (ev.batchId !== batchId) continue;
+    if (ev.kind === "TransferCancelled" && ev.transferId !== null) {
+      cancelEventMap.set(ev.transferId, ev);
+    } else if (ev.kind === "MaterialTransferCancelled" && ev.transferId !== null) {
+      matCancelEventMap.set(ev.transferId, ev);
+    } else if (ev.kind === "BatchCompleted") {
+      batchCompletedEvent = ev;
+    }
+  }
+
+  const entries: HistoryEntry[] = [];
+
+  if (batch) {
+    const ts = Number(batch.createdAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `batch-created-${batchId}`,
+      title: "Batch Created",
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Generator</span>
+            <ParticipantNameDisplay
+              address={batch.generator}
+              info={participantCache.getParticipant(batch.generator)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Original quantity</span>
+            <span>{formatGrams(batch.originalQuantityGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+  }
+
+  for (const t of batchTransfers) {
+    const ts = Number(t.createdAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `transfer-created-${Number(t.id)}`,
+      title: `E-Waste Transfer #${Number(t.id)} Created`,
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>From</span>
+            <ParticipantNameDisplay
+              address={t.sender}
+              info={participantCache.getParticipant(t.sender)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>To</span>
+            <ParticipantNameDisplay
+              address={t.receiver}
+              info={participantCache.getParticipant(t.receiver)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Declared quantity</span>
+            <span>{formatGrams(t.declaredQuantityGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+
+    if (t.receivedQuantityGrams > 0n) {
+      const ts = Number(t.receivedAt);
+      entries.push({
+        timestamp: ts,
+        sortKey: `transfer-received-${Number(t.id)}`,
+        title: `Transfer #${Number(t.id)} Quantity Received`,
+        details: (
+          <>
+            <div style={styles.historyDetailRow}>
+              <span style={styles.label}>Received quantity</span>
+              <span>{formatGrams(t.receivedQuantityGrams)}</span>
+            </div>
+            {t.declaredQuantityGrams !== t.receivedQuantityGrams && (
+              <div style={styles.historyDetailRow}>
+                <span style={styles.label}>Discrepancy</span>
+                <span>{formatGrams(t.declaredQuantityGrams - t.receivedQuantityGrams)}</span>
+              </div>
+            )}
+          </>
+        ),
+      });
+    }
+
+    if (t.status === TRANSFER_STATUS.Confirmed && t.confirmedAt > 0n) {
+      const ts = Number(t.confirmedAt);
+      entries.push({
+        timestamp: ts,
+        sortKey: `transfer-confirmed-${Number(t.id)}`,
+        title: `Transfer #${Number(t.id)} Confirmed`,
+        details: (
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Status</span>
+            <span>Confirmed</span>
+          </div>
+        ),
+      });
+    }
+
+    if (t.status === TRANSFER_STATUS.Cancelled) {
+      const cancelEv = cancelEventMap.get(Number(t.id));
+      entries.push({
+        timestamp: cancelEv ? cancelEv.timestamp : 0,
+        sortKey: `transfer-cancelled-${Number(t.id)}`,
+        title: `Transfer #${Number(t.id)} Cancelled`,
+        txHash: cancelEv ? cancelEv.txHash : undefined,
+        details: (
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Status</span>
+            <span>Cancelled</span>
+          </div>
+        ),
+      });
+    }
+  }
+
+  for (const e of batchEwasteEvents) {
+    const ts = Number(e.processedAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `ewaste-processed-${Number(e.id)}`,
+      title: `E-Waste Processed (Event #${Number(e.id)})`,
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Recycler</span>
+            <ParticipantNameDisplay
+              address={e.recycler}
+              info={participantCache.getParticipant(e.recycler)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Input quantity</span>
+            <span>{formatGrams(e.inputQuantityGrams)}</span>
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Residual</span>
+            <span>{formatGrams(e.residualGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+  }
+
+  for (const m of batchMaterials) {
+    const ts = Number(m.createdAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `material-created-${Number(m.id)}`,
+      title: `Recovered Material #${Number(m.id)} Created`,
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Type</span>
+            <span>{m.materialType}</span>
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Recycler</span>
+            <ParticipantNameDisplay
+              address={m.recycler}
+              info={participantCache.getParticipant(m.recycler)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Produced quantity</span>
+            <span>{formatGrams(m.producedQuantityGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+  }
+
+  for (const t of batchMaterialTransfers) {
+    const material = batchMaterials.find((m) => Number(m.id) === Number(t.materialId));
+    const ts = Number(t.createdAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `material-transfer-created-${Number(t.id)}`,
+      title: `Material Transfer #${Number(t.id)} Created`,
+      details: (
+        <>
+          {material && (
+            <div style={styles.historyDetailRow}>
+              <span style={styles.label}>Material</span>
+              <span>#{Number(material.id)} — {material.materialType}</span>
+            </div>
+          )}
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>From</span>
+            <ParticipantNameDisplay
+              address={t.sender}
+              info={participantCache.getParticipant(t.sender)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>To</span>
+            <ParticipantNameDisplay
+              address={t.receiver}
+              info={participantCache.getParticipant(t.receiver)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Declared quantity</span>
+            <span>{formatGrams(t.declaredQuantityGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+
+    if (t.receivedQuantityGrams > 0n) {
+      const ts = Number(t.receivedAt);
+      entries.push({
+        timestamp: ts,
+        sortKey: `material-transfer-received-${Number(t.id)}`,
+        title: `Material Transfer #${Number(t.id)} Quantity Received`,
+        details: (
+          <>
+            <div style={styles.historyDetailRow}>
+              <span style={styles.label}>Received quantity</span>
+              <span>{formatGrams(t.receivedQuantityGrams)}</span>
+            </div>
+            {t.declaredQuantityGrams !== t.receivedQuantityGrams && (
+              <div style={styles.historyDetailRow}>
+                <span style={styles.label}>Discrepancy</span>
+                <span>{formatGrams(t.declaredQuantityGrams - t.receivedQuantityGrams)}</span>
+              </div>
+            )}
+          </>
+        ),
+      });
+    }
+
+    if (t.status === TRANSFER_STATUS.Confirmed && t.confirmedAt > 0n) {
+      const ts = Number(t.confirmedAt);
+      entries.push({
+        timestamp: ts,
+        sortKey: `material-transfer-confirmed-${Number(t.id)}`,
+        title: `Material Transfer #${Number(t.id)} Confirmed`,
+        details: (
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Status</span>
+            <span>Confirmed</span>
+          </div>
+        ),
+      });
+    }
+
+    if (t.status === TRANSFER_STATUS.Cancelled) {
+      const cancelEv = matCancelEventMap.get(Number(t.id));
+      entries.push({
+        timestamp: cancelEv ? cancelEv.timestamp : 0,
+        sortKey: `material-transfer-cancelled-${Number(t.id)}`,
+        title: `Material Transfer #${Number(t.id)} Cancelled`,
+        txHash: cancelEv ? cancelEv.txHash : undefined,
+        details: (
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Status</span>
+            <span>Cancelled</span>
+          </div>
+        ),
+      });
+    }
+  }
+
+  for (const r of batchProcessingRecords) {
+    const ts = Number(r.processedAt);
+    entries.push({
+      timestamp: ts,
+      sortKey: `material-processed-${Number(r.id)}`,
+      title: `Material Processed (Record #${Number(r.id)})`,
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Material</span>
+            <span>#{Number(r.materialId)}</span>
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Processor</span>
+            <ParticipantNameDisplay
+              address={r.processor}
+              info={participantCache.getParticipant(r.processor)}
+            />
+          </div>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Processed quantity</span>
+            <span>{formatGrams(r.inputQuantityGrams)}</span>
+          </div>
+        </>
+      ),
+    });
+  }
+
+  if (batchCompletedEvent) {
+    entries.push({
+      timestamp: batchCompletedEvent.timestamp,
+      sortKey: `batch-completed-${batchId}`,
+      title: "Batch Completed",
+      txHash: batchCompletedEvent.txHash,
+      details: (
+        <>
+          <div style={styles.historyDetailRow}>
+            <span style={styles.label}>Completed by</span>
+            <ParticipantNameDisplay
+              address={batchCompletedEvent.processor ?? ""}
+              info={participantCache.getParticipant(batchCompletedEvent.processor ?? "")}
+            />
+          </div>
+        </>
+      ),
+    });
+  }
+
+  entries.sort((a, b) => {
+    if (a.timestamp === 0 && b.timestamp === 0) return a.sortKey.localeCompare(b.sortKey);
+    if (a.timestamp === 0) return 1;
+    if (b.timestamp === 0) return -1;
+    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+    return a.sortKey.localeCompare(b.sortKey);
+  });
+
+  return (
+    <div style={styles.section}>
+      <h2 style={styles.h2}>Batch #{batchId} — History</h2>
+      <button
+        style={{ ...styles.buttonSmall, ...styles.buttonSecondary, marginBottom: 16 }}
+        onClick={onBack}
+      >
+        Back to Batches
+      </button>
+
+      {batch ? (
+        <div style={styles.batchCard}>
+          <div style={styles.batchHeader}>
+            <span style={styles.batchId}>Batch #{Number(batch.id)}</span>
+            <span style={batch.status === BATCH_STATUS_ACTIVE ? styles.statusActive : styles.statusDone}>
+              {batch.status === BATCH_STATUS_ACTIVE ? "Active" : "Completed"}
+            </span>
+          </div>
+          <div style={styles.batchRow}>
+            <span style={styles.label}>Generator</span>
+            <ParticipantNameDisplay
+              address={batch.generator}
+              info={participantCache.getParticipant(batch.generator)}
+            />
+          </div>
+          <div style={styles.batchRow}>
+            <span style={styles.label}>Original quantity</span>
+            <span>{formatGrams(batch.originalQuantityGrams)}</span>
+          </div>
+          <div style={styles.batchRow}>
+            <span style={styles.label}>Available</span>
+            <span>{formatGrams(batch.availableQuantityGrams)}</span>
+          </div>
+          <div style={styles.batchRow}>
+            <span style={styles.label}>Created</span>
+            <span>{formatDate(batch.createdAt)}</span>
+          </div>
+        </div>
+      ) : (
+        <p style={styles.statusText}>Batch not found.</p>
+      )}
+
+      <h3 style={styles.h3}>Lifecycle Timeline</h3>
+      {entries.length === 0 ? (
+        <p style={styles.statusText}>No lifecycle events recorded for this batch.</p>
+      ) : (
+        <div style={styles.timeline}>
+          {entries.map((entry, idx) => (
+            <div key={`${entry.sortKey}-${idx}`} style={styles.timelineItem}>
+              <div style={styles.timelineDot} />
+              <div style={styles.timelineContent}>
+                <div style={styles.timelineHeader}>
+                  <span style={styles.timelineTitle}>{entry.title}</span>
+                  <span style={styles.timelineDate}>
+                    {entry.timestamp > 0
+                      ? new Date(entry.timestamp * 1000).toLocaleString()
+                      : "Date unavailable"}
+                  </span>
+                </div>
+                <div style={styles.timelineDetails}>{entry.details}</div>
+                {entry.txHash && (
+                  <a
+                    href={`https://sepolia.etherscan.io/tx/${entry.txHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={styles.txHashLink}
+                  >
+                    View transaction
+                  </a>
+                )}
               </div>
             </div>
           ))}
@@ -2483,6 +3204,17 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 13,
     overflow: "hidden",
     textOverflow: "ellipsis",
+  },
+  participantNameCell: {
+    display: "flex",
+    flexDirection: "column" as const,
+    alignItems: "flex-start",
+    gap: 2,
+  },
+  participantName: {
+    fontWeight: 600,
+    color: "#e2e8f0",
+    fontSize: 14,
   },
   ok: { color: "#4ade80", fontWeight: 600 },
   bad: { color: "#f87171", fontWeight: 600 },
@@ -2609,28 +3341,6 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: "center",
     marginBottom: 8,
   },
-  transferList: {
-    display: "flex",
-    flexDirection: "column" as const,
-    gap: 12,
-  },
-  transferCard: {
-    backgroundColor: "#0f172a",
-    borderRadius: 10,
-    padding: 16,
-    border: "1px solid #334155",
-  },
-  transferHeader: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 10,
-  },
-  transferId: {
-    fontSize: 15,
-    fontWeight: 700,
-    color: "#38bdf8",
-  },
   badge: {
     fontSize: 12,
     fontWeight: 600,
@@ -2652,21 +3362,6 @@ const styles: Record<string, React.CSSProperties> = {
   badgeCancelled: {
     color: "#fca5a5",
     backgroundColor: "#7f1d1d",
-  },
-  approvalRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: "4px 0",
-    gap: 12,
-  },
-  approved: {
-    color: "#4ade80",
-    fontWeight: 600,
-  },
-  pendingApproval: {
-    color: "#fde68a",
-    fontWeight: 600,
   },
   actionGroup: {
     marginTop: 12,
@@ -2728,4 +3423,203 @@ const styles: Record<string, React.CSSProperties> = {
   txMessage: { margin: "0 0 4px 0", fontWeight: 600 },
   txHash: { margin: 0, fontSize: 13, fontFamily: "monospace" },
   link: { color: "#38bdf8" },
+  tableWrap: {
+    overflowX: "auto" as const,
+  },
+  tableHead: {
+    display: "flex",
+    alignItems: "center",
+    padding: "10px 12px",
+    borderBottom: "2px solid #334155",
+    fontSize: 12,
+    fontWeight: 700,
+    color: "#94a3b8",
+    textTransform: "uppercase" as const,
+    letterSpacing: 0.5,
+    gap: 8,
+    minWidth: 640,
+  },
+  tableRow: {
+    display: "flex",
+    alignItems: "center",
+    padding: "10px 12px",
+    borderBottom: "1px solid #1e293b",
+    fontSize: 14,
+    gap: 8,
+    minWidth: 640,
+    transition: "background-color 0.15s",
+  },
+  tableRowClickable: {
+    cursor: "pointer",
+  },
+  colId: {
+    flex: "0 0 56px",
+    fontWeight: 700,
+    color: "#38bdf8",
+  },
+  colFlex: {
+    flex: 1,
+    minWidth: 0,
+    overflow: "hidden",
+  },
+  colQty: {
+    flex: "0 0 80px",
+    textAlign: "right" as const,
+    whiteSpace: "nowrap" as const,
+  },
+  colStatus: {
+    flex: "0 0 90px",
+    textAlign: "center" as const,
+  },
+  colDate: {
+    flex: "0 0 140px",
+    fontSize: 12,
+    color: "#94a3b8",
+    whiteSpace: "nowrap" as const,
+  },
+  filterBar: {
+    display: "flex",
+    flexWrap: "wrap" as const,
+    gap: 12,
+    marginBottom: 16,
+  },
+  filterGroup: {
+    display: "flex",
+    flexWrap: "wrap" as const,
+    gap: 4,
+  },
+  filterBtn: {
+    padding: "6px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    borderRadius: 8,
+    border: "1px solid #334155",
+    backgroundColor: "#0f172a",
+    color: "#94a3b8",
+    cursor: "pointer",
+    transition: "all 0.15s",
+  },
+  filterBtnActive: {
+    padding: "6px 14px",
+    fontSize: 13,
+    fontWeight: 600,
+    borderRadius: 8,
+    border: "1px solid #38bdf8",
+    backgroundColor: "#0c4a6e",
+    color: "#e0f2fe",
+    cursor: "pointer",
+  },
+  fromToCell: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: 4,
+  },
+  fromToLine: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 13,
+  },
+  fromToArrow: {
+    color: "#64748b",
+    flexShrink: 0,
+    fontSize: 11,
+    fontWeight: 600,
+    textTransform: "uppercase" as const,
+    width: 32,
+  },
+  rowDetail: {
+    backgroundColor: "#172033",
+    borderRadius: 10,
+    padding: 16,
+    margin: "4px 0 12px 0",
+    border: "1px solid #334155",
+    minWidth: 640,
+  },
+  rowDetailMeta: {
+    display: "flex",
+    flexWrap: "wrap" as const,
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 13,
+    color: "#94a3b8",
+    marginBottom: 12,
+  },
+  rowDetailApprovals: {
+    fontSize: 13,
+  },
+  colAction: {
+    flex: "0 0 110px",
+    textAlign: "center" as const,
+  },
+  h3: {
+    fontSize: 16,
+    fontWeight: 600,
+    margin: "20px 0 12px 0",
+    color: "#f1f5f9",
+  },
+  timeline: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: 0,
+  },
+  timelineItem: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: 12,
+    paddingBottom: 16,
+    position: "relative" as const,
+  },
+  timelineDot: {
+    width: 10,
+    height: 10,
+    borderRadius: "50%",
+    backgroundColor: "#38bdf8",
+    flexShrink: 0,
+    marginTop: 5,
+  },
+  timelineContent: {
+    flex: 1,
+    minWidth: 0,
+  },
+  timelineHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexWrap: "wrap" as const,
+    gap: 8,
+    marginBottom: 6,
+  },
+  timelineTitle: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "#e2e8f0",
+  },
+  timelineDate: {
+    fontSize: 12,
+    color: "#94a3b8",
+    whiteSpace: "nowrap" as const,
+  },
+  timelineDetails: {
+    backgroundColor: "#0f172a",
+    borderRadius: 8,
+    padding: "10px 14px",
+    border: "1px solid #334155",
+  },
+  historyDetailRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "3px 0",
+    gap: 12,
+    fontSize: 13,
+  },
+  txHashLink: {
+    display: "inline-block",
+    marginTop: 6,
+    fontSize: 12,
+    color: "#38bdf8",
+    textDecoration: "none",
+  },
 };

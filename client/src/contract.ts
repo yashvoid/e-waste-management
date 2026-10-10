@@ -1,5 +1,6 @@
-import { Contract, type BrowserProvider } from "ethers";
+import { Contract, type BrowserProvider, type EventLog } from "ethers";
 import { contractConfig } from "./config";
+import type { BatchHistoryEventInfo } from "./types";
 import type { ParticipantInfo, BatchInfo, TransferInfo, RecoveredMaterialInfo, ProcessingEventInfo, MaterialTransferInfo, MaterialProcessingRecordInfo } from "./types";
 
 const ABI = [
@@ -344,6 +345,37 @@ export async function getProcessingEventCount(provider: BrowserProvider): Promis
   return Number(count);
 }
 
+export async function getAllProcessingEvents(provider: BrowserProvider): Promise<ProcessingEventInfo[]> {
+  const contract = getContract(provider);
+  const count = (await contract.getProcessingEventCount()) as bigint;
+  const countNum = Number(count);
+  const events: ProcessingEventInfo[] = [];
+  for (let i = 1; i <= countNum; i++) {
+    const result = (await contract.getProcessingEvent(i)) as [
+      bigint,
+      bigint,
+      string,
+      bigint,
+      bigint,
+      bigint,
+      boolean,
+    ];
+
+    if (result[6]) {
+      events.push({
+        id: result[0],
+        batchId: result[1],
+        recycler: result[2],
+        inputQuantityGrams: result[3],
+        residualGrams: result[4],
+        processedAt: result[5],
+        exists: result[6],
+      });
+    }
+  }
+  return events;
+}
+
 export async function getMaterialTransferInfo(
   provider: BrowserProvider,
   transferId: number
@@ -523,4 +555,113 @@ export async function getAllMaterialProcessingRecords(provider: BrowserProvider)
     }
   }
   return records;
+}
+
+const CHUNK_SIZE = 9000;
+
+export async function getBatchHistoryEvents(
+  provider: BrowserProvider,
+  batchId: number,
+  ewasteTransferIds: number[],
+  materialTransferIds: number[],
+): Promise<BatchHistoryEventInfo[]> {
+  const contract = getContract(provider);
+  const events: BatchHistoryEventInfo[] = [];
+
+  const blockTimestampCache = new Map<number, number>();
+  async function getBlockTimestamp(blockNum: number): Promise<number> {
+    if (blockTimestampCache.has(blockNum)) return blockTimestampCache.get(blockNum)!;
+    const block = await provider.getBlock(blockNum);
+    const ts = block ? Number(block.timestamp) : 0;
+    blockTimestampCache.set(blockNum, ts);
+    return ts;
+  }
+
+  async function processEvent(
+    log: EventLog,
+    kind: BatchHistoryEventInfo["kind"],
+    transferId: number | null,
+  ): Promise<void> {
+    const blockNum = log.blockNumber;
+    let timestamp = 0;
+    try {
+      timestamp = await getBlockTimestamp(blockNum);
+    } catch {
+      // leave as 0 if block fetch fails
+    }
+    events.push({
+      kind,
+      batchId,
+      transferId,
+      txHash: log.transactionHash || "",
+      blockNumber: blockNum,
+      timestamp,
+    });
+  }
+
+  let currentBlock = 0;
+  try {
+    currentBlock = await provider.getBlockNumber();
+  } catch {
+    return events;
+  }
+
+  async function queryInChunks(
+    filter: unknown,
+    fromBlock: number,
+    toBlock: number,
+  ): Promise<EventLog[]> {
+    const allLogs: EventLog[] = [];
+    for (let start = fromBlock; start <= toBlock; start += CHUNK_SIZE) {
+      const end = Math.min(start + CHUNK_SIZE - 1, toBlock);
+      try {
+        const logs = (await contract.queryFilter(filter as never, start, end)) as EventLog[];
+        allLogs.push(...logs);
+      } catch {
+        // individual chunk failure — keep results from successful chunks
+      }
+    }
+    return allLogs;
+  }
+
+  try {
+    const cancelledFilter = contract.filters.TransferCancelled();
+    const cancelledLogs = await queryInChunks(cancelledFilter, 0, currentBlock);
+    for (const log of cancelledLogs) {
+      const transferId = Number(log.args[0]);
+      if (!ewasteTransferIds.includes(transferId)) continue;
+      await processEvent(log, "TransferCancelled", transferId);
+    }
+  } catch {
+    // RPC query failed entirely
+  }
+
+  try {
+    const matCancelledFilter = contract.filters.MaterialTransferCancelled();
+    const matCancelledLogs = await queryInChunks(matCancelledFilter, 0, currentBlock);
+    for (const log of matCancelledLogs) {
+      const transferId = Number(log.args[0]);
+      if (!materialTransferIds.includes(transferId)) continue;
+      await processEvent(log, "MaterialTransferCancelled", transferId);
+    }
+  } catch {
+    // RPC query failed entirely
+  }
+
+  try {
+    const completedFilter = contract.filters.BatchCompleted(batchId);
+    const completedLogs = await queryInChunks(completedFilter, 0, currentBlock);
+    for (const log of completedLogs) {
+      const processor = (log.args as unknown as [bigint, string, bigint])[1];
+      await processEvent(log, "BatchCompleted", null);
+      const lastIdx = events.length - 1;
+      if (lastIdx >= 0 && events[lastIdx].kind === "BatchCompleted") {
+        events[lastIdx].processor = processor;
+      }
+    }
+  } catch {
+    // RPC query failed entirely
+  }
+
+  return events;
 }

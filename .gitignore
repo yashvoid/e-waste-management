@@ -3,7 +3,10 @@ dist/
 .env
 .env.*
 !.env.example
+blockchain/.env
+client/.env
 blockchain/artifacts/
 blockchain/cache/
+client/.env.example
 blockchain/typechain-types/
 client/tsconfig.tsbuildinfo
